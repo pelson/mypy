@@ -913,77 +913,193 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         is_descriptor_get = defn.info and defn.name == "__get__"
 
-        # Pre-extract callable types and literal fingerprints for every overload
-        # item so that both can be reused across the O(n²) pairwise loop without
-        # redundant calls to extract_callable_type.
-        item_sigs: list[CallableType | None] = []
+        # --- Precomputation (O(n)) ---
+        #
+        # For each overload item compute:
+        #   item_fps   — lightweight literal fingerprint (arg_idx → (pytype, value))
+        #   item_tkeys — template key: same as the callable signature but with every
+        #                LiteralType arg replaced by its fallback type.  Items that
+        #                differ only in which literal value they carry share a key.
+        #
+        # Both use get_proper_type() directly and never call extract_callable_type,
+        # so the cost is O(n * avg_arg_count).
         item_fps: list[_LiteralFingerprint] = []
+        item_tkeys: list[_OverloadTemplateKey | None] = []
         for item in defn.items:
-            assert isinstance(item, Decorator)
-            sig = self.extract_callable_type(item.var.type, item)
-            item_sigs.append(sig)
             fp: _LiteralFingerprint = {}
-            if sig is not None:
-                for idx, arg_type in enumerate(sig.arg_types):
-                    proper = get_proper_type(arg_type)
-                    if isinstance(proper, LiteralType):
-                        fp[idx] = (type(proper.value), proper.value)
+            tkey: _OverloadTemplateKey | None = None
+            if isinstance(item, Decorator):
+                var_type = get_proper_type(item.var.type)
+                if isinstance(var_type, CallableType):
+                    for idx, arg_type in enumerate(var_type.arg_types):
+                        proper = get_proper_type(arg_type)
+                        if isinstance(proper, LiteralType):
+                            fp[idx] = (type(proper.value), proper.value)
+                    tkey = _overload_template_key(var_type)
             item_fps.append(fp)
+            item_tkeys.append(tkey)
 
-        for i, item in enumerate(defn.items):
-            assert isinstance(item, Decorator)
-            sig1 = item_sigs[i]
-            if sig1 is None:
+        # Group item indices by template key.
+        groups: dict[_OverloadTemplateKey | None, list[int]] = {}
+        for idx, tkey in enumerate(item_tkeys):
+            groups.setdefault(tkey, []).append(idx)
+
+        # For each group collect:
+        #   pos_vals[tkey][pos]  — all (pytype, value) pairs seen at that arg position
+        #   all_pos[tkey]        — positions where EVERY group item has a Literal arg
+        #   dup_pairs[tkey]      — (i, j) pairs with identical fingerprints (i < j),
+        #                          i.e. exact duplicate literals that must be checked
+        pos_vals: dict[
+            _OverloadTemplateKey | None, dict[int, set[tuple[type, LiteralValue]]]
+        ] = {}
+        all_pos: dict[_OverloadTemplateKey | None, frozenset[int]] = {}
+        dup_pairs: dict[_OverloadTemplateKey | None, list[tuple[int, int]]] = {}
+
+        for tkey, gidxs in groups.items():
+            n_g = len(gidxs)
+            pcounts: dict[int, int] = {}
+            pvals: dict[int, set[tuple[type, LiteralValue]]] = {}
+            seen: dict[tuple[tuple[int, tuple[type, LiteralValue]], ...], int] = {}
+            dups: list[tuple[int, int]] = []
+            for idx in gidxs:
+                for pos, vkey in item_fps[idx].items():
+                    pcounts[pos] = pcounts.get(pos, 0) + 1
+                    pvals.setdefault(pos, set()).add(vkey)
+                fp_key = tuple(sorted(item_fps[idx].items()))
+                if fp_key in seen:
+                    dups.append((seen[fp_key], idx))
+                else:
+                    seen[fp_key] = idx
+            pos_vals[tkey] = pvals
+            all_pos[tkey] = frozenset(p for p, cnt in pcounts.items() if cnt == n_g)
+            dup_pairs[tkey] = dups
+
+        def _groups_provably_disjoint(
+            ka: _OverloadTemplateKey | None, kb: _OverloadTemplateKey | None
+        ) -> bool:
+            """True if every pair from group ka × group kb is disjoint via Literal args.
+
+            This holds when there is at least one argument position where ALL items
+            in ka have a Literal, ALL items in kb have a Literal, and the two sets
+            of literal values are disjoint — meaning no call can satisfy both.
+            """
+            if ka is None or kb is None:
+                return False
+            for pos in all_pos[ka] & all_pos[kb]:
+                if pos_vals[ka][pos].isdisjoint(pos_vals[kb][pos]):
+                    return True
+            return False
+
+        # --- Build the reduced pair list (typically O(m²) where m << n) ---
+        #
+        # Only two categories of pairs need a full overlap check:
+        #   1. Within-group duplicate-literal pairs (identical fingerprints).
+        #   2. Cross-group pairs when the groups are NOT provably disjoint.
+        #
+        # For the common code-generator pattern (n distinct Literal overloads,
+        # cycling return types → m small groups with disjoint value sets) the
+        # result is an empty or near-empty list, reducing iterations from O(n²)
+        # to O(m²) or better.
+        pairs_to_check: list[tuple[int, int]] = []
+
+        for tkey in groups:
+            pairs_to_check.extend(dup_pairs[tkey])
+
+        group_list = list(groups.items())
+        for gi in range(len(group_list)):
+            tka, gidxs_a = group_list[gi]
+            for gj in range(gi + 1, len(group_list)):
+                tkb, gidxs_b = group_list[gj]
+                if _groups_provably_disjoint(tka, tkb):
+                    continue
+                for ia in gidxs_a:
+                    for jb in gidxs_b:
+                        # Always store the pair in ascending index order so that
+                        # error messages use the same (lower, higher) convention
+                        # as the original O(n²) loop.
+                        if ia < jb:
+                            pairs_to_check.append((ia, jb))
+                        else:
+                            pairs_to_check.append((jb, ia))
+
+        # Sort so errors are reported in the same order as the original loop.
+        pairs_to_check.sort()
+
+        # Lazy sig cache — extract_callable_type is only called for items that
+        # actually appear in pairs_to_check or the impl-check loop below.
+        sig_cache: dict[int, CallableType | None] = {}
+
+        def _get_sig(k: int) -> CallableType | None:
+            if k not in sig_cache:
+                item_k = defn.items[k]
+                assert isinstance(item_k, Decorator)
+                sig_cache[k] = self.extract_callable_type(item_k.var.type, item_k)
+            return sig_cache[k]
+
+        # --- Pairwise overlap checks (reduced set) ---
+        for i, j in pairs_to_check:
+            item_i = defn.items[i]
+            item_j = defn.items[j]
+            assert isinstance(item_i, Decorator)
+            assert isinstance(item_j, Decorator)
+
+            # Fast path: still catches individual disjoint pairs inside a
+            # non-provably-disjoint group pair (e.g. when one side has no
+            # Literal at all but a few cross-group pairs happen to be disjoint).
+            if _literal_args_are_disjoint(item_fps[i], item_fps[j]):
                 continue
 
-            for j, item2 in enumerate(defn.items[i + 1 :]):
-                assert isinstance(item2, Decorator)
-                sig2 = item_sigs[i + 1 + j]
-                if sig2 is None:
-                    continue
+            sig1 = _get_sig(i)
+            if sig1 is None:
+                continue
+            sig2 = _get_sig(j)
+            if sig2 is None:
+                continue
 
-                # Fast path: if there is any argument position where both overloads
-                # carry a LiteralType with different values they are provably
-                # disjoint — no call can match both, so no overlap is possible.
-                if _literal_args_are_disjoint(item_fps[i], item_fps[i + 1 + j]):
-                    continue
+            if not are_argument_counts_overlapping(sig1, sig2):
+                continue
 
-                if not are_argument_counts_overlapping(sig1, sig2):
-                    continue
-
-                if overload_can_never_match(sig1, sig2):
-                    self.msg.overloaded_signature_will_never_match(i + 1, i + j + 2, item2.func)
-                elif not is_descriptor_get:
-                    # Note: we force mypy to check overload signatures in strict-optional mode
-                    # so we don't incorrectly report errors when a user tries typing an overload
-                    # that happens to have a 'if the argument is None' fallback.
-                    #
-                    # For example, the following is fine in strict-optional mode but would throw
-                    # the unsafe overlap error when strict-optional is disabled:
-                    #
-                    #     @overload
-                    #     def foo(x: None) -> int: ...
-                    #     @overload
-                    #     def foo(x: str) -> str: ...
-                    #
-                    # See Python 2's map function for a concrete example of this kind of overload.
-                    current_class = self.scope.active_class()
-                    type_vars = current_class.defn.type_vars if current_class else []
-                    with state.strict_optional_set(True):
-                        if is_unsafe_overlapping_overload_signatures(sig1, sig2, type_vars):
-                            flip_note = (
-                                j == 0
-                                and not is_unsafe_overlapping_overload_signatures(
-                                    sig2, sig1, type_vars
-                                )
-                                and not overload_can_never_match(sig2, sig1)
+            if overload_can_never_match(sig1, sig2):
+                self.msg.overloaded_signature_will_never_match(i + 1, j + 1, item_j.func)
+            elif not is_descriptor_get:
+                # Note: we force mypy to check overload signatures in strict-optional mode
+                # so we don't incorrectly report errors when a user tries typing an overload
+                # that happens to have a 'if the argument is None' fallback.
+                #
+                # For example, the following is fine in strict-optional mode but would throw
+                # the unsafe overlap error when strict-optional is disabled:
+                #
+                #     @overload
+                #     def foo(x: None) -> int: ...
+                #     @overload
+                #     def foo(x: str) -> str: ...
+                #
+                # See Python 2's map function for a concrete example of this kind of overload.
+                current_class = self.scope.active_class()
+                type_vars = current_class.defn.type_vars if current_class else []
+                with state.strict_optional_set(True):
+                    if is_unsafe_overlapping_overload_signatures(sig1, sig2, type_vars):
+                        # Suggest flipping the order when i and j are consecutive and
+                        # swapping would resolve the overlap.
+                        flip_note = (
+                            j == i + 1
+                            and not is_unsafe_overlapping_overload_signatures(
+                                sig2, sig1, type_vars
                             )
-                            self.msg.overloaded_signatures_overlap(
-                                i + 1, i + j + 2, flip_note, item.func
-                            )
+                            and not overload_can_never_match(sig2, sig1)
+                        )
+                        self.msg.overloaded_signatures_overlap(
+                            i + 1, j + 1, flip_note, item_i.func
+                        )
 
-            if impl_type is not None:
-                assert defn.impl is not None
+        # --- Implementation compatibility checks (O(n), separate loop) ---
+        if impl_type is not None:
+            assert defn.impl is not None
+            for i, item in enumerate(defn.items):
+                assert isinstance(item, Decorator)
+                sig1 = _get_sig(i)
+                if sig1 is None:
+                    continue
 
                 # This is what we want from implementation, it should accept all arguments
                 # of an overload, but the return types should go the opposite way.
@@ -8988,6 +9104,32 @@ def detach_callable(typ: CallableType, class_type_vars: list[TypeVarLikeType]) -
 # the key means Literal[1] (int) and Literal[True] (bool) are kept distinct
 # even though 1 == True in Python.
 _LiteralFingerprint = dict[int, tuple[type, LiteralValue]]
+
+# Template key for grouping structurally-identical overloads.  Two overloads
+# share a key when they have the same argument kinds, the same argument types
+# with all LiteralType args collapsed to their fallback type, and the same
+# return type.  Overloads that differ only in which Literal value they carry
+# therefore belong to the same group.
+_OverloadTemplateKey = tuple[object, ...]
+
+
+def _overload_template_key(var_type: CallableType) -> _OverloadTemplateKey:
+    """Return a hashable key that groups structurally-identical overloads.
+
+    LiteralType arguments are collapsed to a ``("Literal", fallback_fullname)``
+    marker so that overloads differing only in their literal value share a key.
+    All other types are represented by their ``str()`` form, which is stable and
+    hashable for every mypy Type subclass.
+    """
+    parts: list[object] = [tuple(var_type.arg_kinds)]
+    for arg_type in var_type.arg_types:
+        proper = get_proper_type(arg_type)
+        if isinstance(proper, LiteralType):
+            parts.append(("Literal", proper.fallback.type.fullname))
+        else:
+            parts.append(str(proper))
+    parts.append(str(get_proper_type(var_type.ret_type)))
+    return tuple(parts)
 
 
 def _literal_args_are_disjoint(fp1: _LiteralFingerprint, fp2: _LiteralFingerprint) -> bool:
