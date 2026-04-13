@@ -213,6 +213,7 @@ from mypy.types import (
     FunctionLike,
     Instance,
     LiteralType,
+    LiteralValue,
     NoneType,
     Overloaded,
     PartialType,
@@ -911,16 +912,40 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             impl_type = self.extract_callable_type(inner_type, defn.impl)
 
         is_descriptor_get = defn.info and defn.name == "__get__"
+
+        # Pre-extract callable types and literal fingerprints for every overload
+        # item so that both can be reused across the O(n²) pairwise loop without
+        # redundant calls to extract_callable_type.
+        item_sigs: list[CallableType | None] = []
+        item_fps: list[_LiteralFingerprint] = []
+        for item in defn.items:
+            assert isinstance(item, Decorator)
+            sig = self.extract_callable_type(item.var.type, item)
+            item_sigs.append(sig)
+            fp: _LiteralFingerprint = {}
+            if sig is not None:
+                for idx, arg_type in enumerate(sig.arg_types):
+                    proper = get_proper_type(arg_type)
+                    if isinstance(proper, LiteralType):
+                        fp[idx] = (type(proper.value), proper.value)
+            item_fps.append(fp)
+
         for i, item in enumerate(defn.items):
             assert isinstance(item, Decorator)
-            sig1 = self.extract_callable_type(item.var.type, item)
+            sig1 = item_sigs[i]
             if sig1 is None:
                 continue
 
             for j, item2 in enumerate(defn.items[i + 1 :]):
                 assert isinstance(item2, Decorator)
-                sig2 = self.extract_callable_type(item2.var.type, item2)
+                sig2 = item_sigs[i + 1 + j]
                 if sig2 is None:
+                    continue
+
+                # Fast path: if there is any argument position where both overloads
+                # carry a LiteralType with different values they are provably
+                # disjoint — no call can match both, so no overlap is possible.
+                if _literal_args_are_disjoint(item_fps[i], item_fps[i + 1 + j]):
                     continue
 
                 if not are_argument_counts_overlapping(sig1, sig2):
@@ -8956,6 +8981,27 @@ def detach_callable(typ: CallableType, class_type_vars: list[TypeVarLikeType]) -
         # Fast path, nothing to update.
         return typ
     return typ.copy_modified(variables=list(typ.variables) + class_type_vars)
+
+
+# Fingerprint type for literal-disjointness checks: maps argument index to
+# (Python type of the value, the value itself).  Using type(value) as part of
+# the key means Literal[1] (int) and Literal[True] (bool) are kept distinct
+# even though 1 == True in Python.
+_LiteralFingerprint = dict[int, tuple[type, LiteralValue]]
+
+
+def _literal_args_are_disjoint(fp1: _LiteralFingerprint, fp2: _LiteralFingerprint) -> bool:
+    """Return True if two overloads are provably disjoint via a Literal argument.
+
+    If there is any argument position where both carry a LiteralType with
+    different values, no single call can match both overloads and the pairwise
+    overlap check can be skipped entirely.
+    """
+    for idx, key1 in fp1.items():
+        key2 = fp2.get(idx)
+        if key2 is not None and key2 != key1:
+            return True
+    return False
 
 
 def overload_can_never_match(signature: CallableType, other: CallableType) -> bool:
